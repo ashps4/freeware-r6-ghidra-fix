@@ -38,11 +38,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           api='https://api.github.com/repos/NationalSecurityAgency/ghidra/releases/tags/Ghidra_12.1.4_build'
 
           echo "Lade Ghidra Release-Informationen..."
-
           curl -fsSL \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GH_TOKEN" \
@@ -61,19 +59,16 @@ jobs:
           unzip -q ghidra.zip -d ghidra-dist
 
           analyzer="$(find "$PWD/ghidra-dist" -type f -path '*/support/analyzeHeadless' -print -quit)"
-
           test -n "$analyzer" || {
             echo "analyzeHeadless wurde nicht gefunden."
             exit 1
           }
 
           chmod +x "$analyzer"
-
           ghidra_home="$(dirname "$(dirname "$analyzer")")"
 
           echo "GHIDRA_ANALYZER=$analyzer" >> "$GITHUB_ENV"
           echo "GHIDRA_HOME=$ghidra_home" >> "$GITHUB_ENV"
-
           echo "Ghidra installiert: $ghidra_home"
           grep -E 'application.version|application.release.name' \
             "$ghidra_home/Ghidra/application.properties" || true
@@ -87,13 +82,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           git clone --depth 1 --branch 1.0156 \
             https://github.com/astrelsky/GhidraOrbis.git \
             third_party/GhidraOrbis
 
           cd third_party/GhidraOrbis
-
           gradle buildExtension \
             -PGHIDRA_INSTALL_DIR="$GHIDRA_HOME" \
             --no-daemon --stacktrace 2>&1 \
@@ -101,7 +94,6 @@ jobs:
 
           shopt -s nullglob
           zips=(dist/*.zip)
-
           if [[ ${#zips[@]} -eq 0 ]]; then
             echo 'GhidraOrbis build did not produce dist/*.zip.'
             exit 1
@@ -109,18 +101,15 @@ jobs:
 
           mkdir -p "$GITHUB_WORKSPACE/analysis/build"
           cp "${zips[0]}" "$GITHUB_WORKSPACE/analysis/build/"
-
           mkdir -p "$GHIDRA_HOME/Ghidra/Extensions"
           unzip -q "${zips[0]}" -d "$GHIDRA_HOME/Ghidra/Extensions"
 
           props="$(find "$GHIDRA_HOME/Ghidra/Extensions" \
             -type f -name extension.properties -print -quit)"
-
           test -n "$props" || {
             echo 'Could not verify GhidraOrbis extension.'
             exit 1
           }
-
           echo "Installed extension metadata: $props"
 
       - name: Download eboot.bin from R6
@@ -129,11 +118,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-
           API="https://api.github.com/repos/ashps4/freeware/releases/tags/R6"
 
           echo "Lade R6 Release-Informationen..."
-
           curl -fsSL \
             -H "Accept: application/vnd.github+json" \
             -H "Authorization: Bearer $GH_TOKEN" \
@@ -145,18 +132,14 @@ jobs:
           ASSET_ID="$(jq -er \
             '.assets[] | select(.name == "eboot.bin") | .id' \
             release.json)"
-
           ASSET_URL="$(jq -er \
             '.assets[] | select(.name == "eboot.bin") | .browser_download_url' \
             release.json)"
 
           echo "eboot.bin gefunden: Asset-ID $ASSET_ID"
-
           if ! curl -fL --retry 3 --retry-all-errors \
             "$ASSET_URL" -o eboot.bin; then
-
             echo "Direkter Download fehlgeschlagen. Versuche Asset-API..."
-
             curl -fL --retry 3 --retry-all-errors \
               -H "Accept: application/octet-stream" \
               -H "Authorization: Bearer $GH_TOKEN" \
@@ -165,7 +148,6 @@ jobs:
           fi
 
           test -s eboot.bin
-
           echo "Download erfolgreich:"
           ls -lh eboot.bin
           file eboot.bin
@@ -174,52 +156,62 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           python3 scripts/inspect_eboot.py "$EBOOT" \
             | tee analysis/eboot-inspection.txt
 
-      - name: Analyze eboot with GhidraOrbis installed
+      - name: Analyze eboot with GhidraOrbis installed (ELF image-base workaround)
         shell: bash
         run: |
           set -euo pipefail
-
           runner_kb="$(awk '/MemTotal:/ {print $2}' /proc/meminfo)"
-
-          # Ghidra auf 8 GB Java-Heap begrenzen
           export GHIDRA_HEADLESS_MAXMEM=8G
 
           echo "Runner memory: ${runner_kb} KB"
           echo "Ghidra headless heap: ${GHIDRA_HEADLESS_MAXMEM}"
+          echo "ELF loader image base override: 0"
 
           mkdir -p analysis/project analysis/reports analysis/logs
 
           "$GHIDRA_ANALYZER" "$PWD/analysis/project" PS4_R6 \
-            -import "$EBOOT" \
             -scriptPath "$PWD/ghidra_scripts" \
+            -preScript ReportImageBase.java \
+            -import "$EBOOT" \
+            -loader ElfLoader \
+            -loader-imagebase 0 \
             -postScript ExportFunctions.java "$PWD/analysis/reports/eboot.functions.csv" \
             -analysisTimeoutPerFile 18000 \
             -max-cpu 2 \
-            -log "$PWD/analysis/logs/eboot.log"
+            -log "$PWD/analysis/logs/eboot.log" \
+            2>&1 | tee "$PWD/analysis/logs/headless-console.log"
 
       - name: Record loader diagnostics and verify function export
         if: always()
         shell: bash
         run: |
           set -euo pipefail
-
-          if [[ -f analysis/logs/eboot.log ]]; then
-            grep -Ei 'Using Loader:|Using Language/Compiler:|Orbis|PS4|ERROR|Exception|OutOfMemory' \
-              analysis/logs/eboot.log \
-              | tail -n 120 > analysis/loader-diagnostics.txt || true
-          fi
+          mkdir -p analysis/logs analysis/reports
+          {
+            echo "Ghidra loader workaround: ElfLoader with image base 0"
+            echo "Expected image base: 00000000"
+            for log in analysis/logs/eboot.log analysis/logs/headless-console.log; do
+              if [[ -f "$log" ]]; then
+                echo
+                echo "===== $log ====="
+                echo "GccExceptionAnalyzer message count: $(grep -c 'GccExceptionAnalyzer' "$log" || true)"
+                grep -Ei 'Using Loader:|Using Language/Compiler:|image.?base|Orbis|PS4|GccExceptionAnalyzer|ERROR|Exception|OutOfMemory|Wrote function export' "$log" \
+                  | tail -n 160 || true
+              fi
+            done
+          } > analysis/loader-diagnostics.txt
 
           if [[ ! -s analysis/reports/eboot.functions.csv ]]; then
             echo 'No function CSV was generated.'
-            echo 'Check analysis/logs/eboot.log and loader-diagnostics.txt.'
+            echo 'Check analysis/logs/eboot.log, analysis/logs/headless-console.log, and analysis/loader-diagnostics.txt.'
             exit 1
           fi
 
           echo 'Function export created:'
+          wc -l analysis/reports/eboot.functions.csv
           head -n 5 analysis/reports/eboot.functions.csv
 
       - name: Merge function listings
@@ -227,14 +219,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
-          if [[ -f scripts/merge_function_reports.py ]]; then
+          shopt -s nullglob
+          reports=(analysis/reports/*.functions.csv)
+          if (( ${#reports[@]} > 0 )); then
             python3 scripts/merge_function_reports.py \
               --reports analysis/reports \
               --output analysis/reports/all_functions.csv \
               --html analysis/reports/index.html
           else
-            echo "Merge script not found; skipping."
+            echo 'No per-binary function CSV exists; merge skipped.'
           fi
 
       - name: Upload analysis package
